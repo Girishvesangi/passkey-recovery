@@ -327,6 +327,17 @@ app.get('/me', requireSession, async (req: any, res) => {
   res.json(u);
 });
 
+app.get('/passkeys',requireSession,async (req: any, res)=>{
+    const {rows}= await db.query(
+        `SELECT credential_id, label, device_type, backed_up, counter, created_at, last_used_at, revoked_at
+        FROM passkeys
+        WHERE user_id= $1
+        ORDER BY created_at ASC`,
+        [req.userId]
+    );
+    res.json(rows);
+});
+
 app.post('/logout', requireSession, async (req: any, res) => {
   await db.query(`DELETE FROM sessions WHERE token_hash = $1`, [
     hashToken(req.cookies.session),

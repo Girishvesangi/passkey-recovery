@@ -1,48 +1,34 @@
-import { useEffect, useState } from 'react'
-import './App.css'
-import { RegisterForm } from './RegisterForm';
-import { startAuthentication } from '@simplewebauthn/browser';
-function App() {
-  const [status, setStatus]=useState('checking...');
-  useEffect(()=>{
-    fetch('http://localhost:3000/health')
-      .then(r=>r.json())
-      .then(j=>setStatus(j.database==='ok'?'API connected':'API up, DB down'))
-      .catch(()=>setStatus('API unreachable'));
-  },[]);
+import type { ReactNode } from 'react';
+import {Navigate, Route, Routes} from 'react-router-dom'
+import { useAuth } from './auth/AuthContext';
+import { Landing } from './pages/Landing';
+import { RegisterPage } from './pages/RegisterPage';
+import { LoginPage } from './pages/LoginPage';
+import { Dashboard } from './pages/Dashboard';
 
-  async function login() {
-  const { flowId, options } = await (
-    await fetch('http://localhost:3000/auth/options', { method: 'POST' })
-  ).json();
-  const authResp = await startAuthentication({ optionsJSON: options });
-  const verifyRes = await fetch('http://localhost:3000/auth/verify', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify({ flowId, response: authResp }),
-  });
-  if (!verifyRes.ok) throw new Error('Login failed');
+
+function ProtectedRoute({children}:{children:ReactNode}){
+  const {user, loading}=useAuth();
+  if(loading) return <p>Loading...</p>
+  if(!user) return <Navigate to="/login" replace/>;
+  return <>{children}</>;
 }
 
-
-  async function handleLogin() {
-  try {
-    setStatus('Waiting for Touch ID…');
-    await login();
-    setStatus('Logged in!');
-  } catch {
-    setStatus('Login failed');
-  }
+export default function App(){
+  return (
+    <Routes>
+      <Route path="/" element={<Landing/>} />
+      <Route path="/register" element={<RegisterPage/>}/>
+      <Route path="/login" element={<LoginPage/>}/>
+      <Route
+      path="/dashboard"
+      element={
+        <ProtectedRoute>
+          <Dashboard/>
+        </ProtectedRoute>
+      }
+      />
+      <Route path="*" element={<Navigate to="/" replace/>}/>
+    </Routes>
+  );
 }
-
-  return <>
-  <h1>{status}</h1>
-  <RegisterForm/>
-  <button onClick={handleLogin}>Log in with passkey</button>
-  <p>{status}</p>
-  </>
-  
-}
-
-export default App
