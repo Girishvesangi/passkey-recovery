@@ -39,6 +39,10 @@ app.get('/health', async (req,res)=>{
     }
 });
 
+const renameSchema=z.object({
+  label: z.string().trim().min(1).max(40),
+});
+
 app.post('/register/options', async (req, res) => {
   // 1. Validate — never trust the browser; bad input gets a clean 400.
   const parsed = registerOptionsSchema.safeParse(req.body);
@@ -337,6 +341,188 @@ app.get('/passkeys',requireSession,async (req: any, res)=>{
     );
     res.json(rows);
 });
+
+
+app.patch('/passkeys/:credentialId', requireSession, async (req:any, res)=>{
+  const parsed= renameSchema.safeParse(req.body);
+  if(!parsed.success){
+    return res.status(400).json({error:'Label must be 1-40 characters'});
+  }
+
+  const {rowCount}= await db.query(
+    `UPDATE passkeys SET label=$1
+    WHERE credential_id = $2 AND user_id=$3`,
+    [parsed.data.label,req.params.credentialId,req.userId]
+  );
+  if(!rowCount){
+    return res.status(404).json({error:'Passkey not found'});
+  };
+  res.json({ok:true});
+})
+
+app.post('/passkeys/:credentialId/revoke',requireSession,async (req:any,res)=>{
+  const client = await db.connect();
+  try{
+    await client.query('BEGIN');
+    const {rows:[pk]}= await client.query(
+      `SELECT credential_id, revoked_at FROM passkeys
+      WHERE credential_id = $1 AND user_id= $2`,
+      [req.params.credentialId, req.userId]
+    );
+    if(!pk){
+      await client.query('ROLLBACK');
+      return res.status(404).json({error:'Passkey not found'});
+    }
+    if(pk.revoked_at){
+      await client.query('ROLLBACK');
+      return res.status(400).json({error:'Passkey already revoked'});
+    }
+    const {rows:[{count}]}= await client.query(
+      `SELECT COUNT(*) :: int AS count FROM passkeys
+      WHERE user_id= $1 AND revoked_at IS NULL`,
+      [req.userId]
+    );
+    if(count<=1){
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'You cannot revoke your last passkey until recovery is set up',
+      });
+    }
+    await client.query(
+      `UPDATE passkeys SET revoked_at= now()
+      WHERE credential_id = $1 AND user_id=$2`,
+      [req.params.credentialId, req.userId]
+    );
+    await client.query('COMMIT');
+    res.json({ok:true});
+  }catch{
+    await client.query('ROLLBACK');
+    return res.status(500).json({error:'Internal server error'});
+  }finally{
+    client.release();
+  }
+});
+
+
+app.post('/passkeys/register/options', requireSession, async (req: any, res) => {
+  const { rows: [u] } = await db.query(
+    `SELECT id, username, display_name FROM users WHERE id = $1`,
+    [req.userId]
+  );
+  if (!u) return res.status(404).json({ error: 'User not found' });
+
+  const { rows: existing } = await db.query(
+    `SELECT credential_id, transports FROM passkeys
+     WHERE user_id = $1 AND revoked_at IS NULL`,
+    [req.userId]
+  );
+
+  const options = await generateRegistrationOptions({
+    rpName: process.env.RP_NAME!,
+    rpID: process.env.RP_ID!,
+    userID: new TextEncoder().encode(u.id),
+    userName: u.username,
+    userDisplayName: u.display_name,
+    attestationType: 'none',
+    authenticatorSelection: {
+      residentKey: 'required',
+      userVerification: 'preferred',
+    },
+    excludeCredentials: existing.map((p) => ({
+      id: p.credential_id,
+      transports: p.transports ?? [],
+    })),
+  });
+
+  const { rows } = await db.query(
+    `INSERT INTO webauthn_challenges
+       (ceremony, challenge, user_id, pending_webauthn_user_id, expires_at)
+     VALUES ('register', $1, $2, $3, $4)
+     RETURNING id`,
+    [options.challenge, req.userId, options.user.id,
+     new Date(Date.now() + 5 * 60_000)]
+  );
+
+  res.json({ flowId: rows[0].id, options });
+});
+
+app.post('/passkeys/register/verify', requireSession, async (req: any, res) => {
+  const parsed = registerVerifySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid request' });
+  }
+  const { flowId, response } = parsed.data;
+
+  const { rows: [flow] } = await db.query(
+    `SELECT * FROM webauthn_challenges
+     WHERE id = $1 AND ceremony = 'register' AND user_id = $2
+       AND consumed_at IS NULL AND expires_at > now()`,
+    [flowId, req.userId]
+  );
+  if (!flow) {
+    return res.status(400).json({ error: 'Challenge not found, expired, or already used' });
+  }
+
+  let verification;
+  try {
+    verification = await verifyRegistrationResponse({
+      response,
+      expectedChallenge: flow.challenge,
+      expectedOrigin: process.env.EXPECTED_ORIGIN!,
+      expectedRPID: process.env.RP_ID!,
+      requireUserVerification: true,
+    });
+  } catch {
+    return res.status(400).json({ error: 'Registration could not be verified' });
+  }
+  if (!verification.verified || !verification.registrationInfo) {
+    return res.status(400).json({ error: 'Registration could not be verified' });
+  }
+  const info = verification.registrationInfo;
+  const credential = info.credential;
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO passkeys
+         (credential_id, user_id, webauthn_user_id, public_key, counter, transports, device_type, backed_up)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        credential.id,
+        req.userId,
+        flow.pending_webauthn_user_id,
+        Buffer.from(credential.publicKey),
+        credential.counter,
+        credential.transports ?? [],
+        info.credentialDeviceType,
+        info.credentialBackedUp,
+      ]
+    );
+    await client.query(
+      `UPDATE webauthn_challenges SET consumed_at = now() WHERE id = $1`,
+      [flowId]
+    );
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    if (err?.code === '23505') {
+      return res.status(409).json({ error: 'That passkey is already registered' });
+    }
+    return res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/logout-all', requireSession, async(req:any, res)=>{
+  await db.query(`DELETE FROM sessions WHERE user_id=$1`,[req.userOd]);
+  res.clearCookie('session');
+  res.json({ok:true});
+});
+
+
 
 app.post('/logout', requireSession, async (req: any, res) => {
   await db.query(`DELETE FROM sessions WHERE token_hash = $1`, [
